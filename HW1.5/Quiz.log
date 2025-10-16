@@ -1,0 +1,29 @@
+***** Section <default> *****
+Stats: size=64  blocks=64  symbols=12  literals=1  relocations=5
+Blocks
+    name        start   size  #ins #dir #sto
+    <default>   00000  00040    14    7    1
+Symbols
+    name        hex       dec  scope     kind      type      description
+    *0       00002D        45  local     relative  data      label
+    FIRST    000000         0  local     relative  code      label
+    FUNCA    000000         0  imported  relative  notlabel  
+    FUNCB    000000         0  imported  relative  notlabel  
+    HALT     00002A        42  local     relative  code      label
+    ILOOP    00000B        11  local     relative  code      label
+    INIT     000000         0  imported  relative  notlabel  
+    MAXLEN   000008         8  local     absolute  notlabel  8
+    OLOOP    00001A        26  local     relative  code      label
+    QUIZ     000000         0  exported  relative  code      label
+    STRIN    000030        48  local     relative  data      label
+    STROUT   000038        56  local     relative  data      label
+Literals
+    label   definition
+    *0      WORD X'000000'
+Relocations
+    address length flag symbol
+    00001        5  +    INIT
+    00008        5
+    0000F        5  +    FUNCA
+    0001B        5  +    FUNCB
+    00022        5

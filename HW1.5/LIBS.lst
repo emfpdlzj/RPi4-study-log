@@ -1,0 +1,22 @@
+00000            LIBS    START   0    
+00000                    EXTDEF  INIT,FUNCA,FUNCB    
+                  
+00000  012027    INIT    LDA     #BUFFER    
+00003  0F2021            STA     PTR    
+00006  4F0000            RSUB        
+00009  56201B    FUNCA   STCH    @PTR    
+0000C  032018            LDA     PTR    
+0000F  190001            ADD     #1    
+00012  0F2012            STA     PTR    
+00015  4F0000            RSUB        
+                  
+00018  03200C    FUNCB   LDA     PTR    
+0001B  1F2138            SUB     *0 (WORD X'000001')    
+0001E  0F2006            STA     PTR    
+00021  522003            LDCH    @PTR    
+00024  4F0000            RSUB        
+                  
+00027  000000    PTR     RESW    1    
+0002A  00....00  BUFFER  RESW    100    
+00156  000001    *0      WORD    X'000001'    
+00159                    END     LIBS    

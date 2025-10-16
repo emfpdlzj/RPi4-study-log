@@ -1,0 +1,23 @@
+00000            QUIZ    START   0    
+00000                    EXTREF  INIT,FUNCA,FUNCB    
+                  
+00000  4B100000  FIRST  +JSUB    INIT    
+00004  072026            LDX     *0 (WORD X'000000')    
+00007  75100008         +LDT     #MAXLEN    
+0000B  53A022    ILOOP   LDCH    STRIN,X    
+0000E  4B100000         +JSUB    FUNCA    
+00012  B850              TIXR    T    
+00014  3B2FF4            JLT     ILOOP    
+00017  072013            LDX     *0 (WORD X'000000')    
+0001A  4B100000  OLOOP  +JSUB    FUNCB    
+0001E  190020            ADD     #32    
+00021  57900038         +STCH    STROUT,X    
+00025  B850              TIXR    T    
+00027  3B2FF0            JLT     OLOOP    
+0002A  3F2FFD    HALT    J       HALT    
+0002D                    LTORG       
+0002D  000000    *0      WORD    X'000000'    
+00030  53....44  STRIN   BYTE    C'STRESSED'    
+00038            MAXLEN  EQU     8    
+00038  00....00  STROUT  RESB    MAXLEN    
+00040                    END     QUIZ    

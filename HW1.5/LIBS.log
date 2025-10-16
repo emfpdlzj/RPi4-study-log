@@ -1,0 +1,19 @@
+***** Section <default> *****
+Stats: size=345  blocks=345  symbols=7  literals=1  relocations=0
+Blocks
+    name        start   size  #ins #dir #sto
+    <default>   00000  00159    13    4    2
+Symbols
+    name        hex       dec  scope     kind      type      description
+    *0       000156       342  local     relative  data      label
+    BUFFER   00002A        42  local     relative  data      label
+    FUNCA    000009         9  exported  relative  code      label
+    FUNCB    000018        24  exported  relative  code      label
+    INIT     000000         0  exported  relative  code      label
+    LIBS     000000         0  exported  relative  code      label
+    PTR      000027        39  local     relative  data      label
+Literals
+    label   definition
+    *0      WORD X'000001'
+Relocations
+    address length flag symbol
