@@ -1,131 +1,227 @@
-#include <stdio.h>      // printf, perror 등 표준 입출력 함수
-#include <stdlib.h>     // exit 등 유틸리티 함수
-#include <unistd.h>     // usleep 등 POSIX 함수
-#include <pthread.h>    // pthread_create, pthread_join 등 쓰레드 함수
-#include <time.h>       // clock_gettime, nanosleep 등 시간 관련 함수
-#include <gpiod.h>      // libgpiod GPIO 제어 함수
+// 초음파센서 & LED 제어 :측정 거리가 작을수록 LED가 밝아지고 클수록 어두워지는 예제
+//  스레드1: HC-SR04 거리 측정 -> distance 갱신
+//  스레드2: distance 기반 LED PWM
 
-// GPIO 핀 번호 정의 (BCM 기준)
-#define TRIG_PIN 23     // 초음파 센서 TRIG 핀
-#define ECHO_PIN 24     // 초음파 센서 ECHO 핀
-#define LED_PIN 18      // LED 연결 핀
+#include <gpiod.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
 
-#define CHIP_NAME "gpiochip0"      // 사용할 GPIO 칩 이름
-#define CONSUMER "ultrasonic_pwm"  // GPIO 소비자 이름 (로그 등에서 사용)
+// 핀설정
+#define PIN_TRIG 23
+#define PIN_ECHO 24
+#define PIN_LED 18
 
-// 공유 거리 변수 (두 스레드 간 공유됨)
-volatile double distance = 0.0;
+#define DIST_MIN 5.0            // 이보다 가까우면 최대 밝기
+#define DIST_MAX 200.0          // 이보다 멀면 최소 밝기
+#define PWM_PERIOD_NS 2000000L  // pwm 1주기
 
-// GPIO 핸들 전역 변수
-struct gpiod_chip *chip;
-struct gpiod_line *trig, *echo, *led;
+static double distance = 999.0;
+static pthread_mutex_t dist_mx = PTHREAD_MUTEX_INITIALIZER;  // mutex 구현
+static volatile sig_atomic_t g_stop = 0;                     // mutex구현
 
-// 마이크로초 단위 지연 함수
-void delay_us(int us) {
+// 핀 포인터 선언
+static struct gpiod_chip* chip = NULL;
+static struct gpiod_line* line_trig = NULL;
+static struct gpiod_line* line_echo = NULL;
+static struct gpiod_line* line_led = NULL;
+
+static void nsleep(long ns) {  // 나노초로 변환.
     struct timespec ts;
-    ts.tv_sec = us / 1000000;
-    ts.tv_nsec = (us % 1000000) * 1000;
-    nanosleep(&ts, NULL);  // 정밀한 us 단위 대기
+    ts.tv_sec = ns / 1000000000L;
+    ts.tv_nsec = ns % 1000000000L;
+    clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
+    // 현재 시점부터 ts 만큼 스레드를 sleep -> pwm 유지
 }
 
-// 거리 측정 스레드 함수
-void* measure_distance(void* arg) {
-    while (1) {
-        // TRIG 핀에 10us 펄스를 보냄 (초음파 송신)
-        gpiod_line_set_value(trig, 0);
-        delay_us(2);
-        gpiod_line_set_value(trig, 1);
-        delay_us(10);
-        gpiod_line_set_value(trig, 0);
+static void on_sigint(int signo) {  // 시그널 핸들러, 안전종료
+    (void)signo;
+    g_stop = 1;
+}
 
-        // ECHO 핀이 HIGH 될 때까지 대기 (초음파 수신 시작)
-        while (gpiod_line_get_value(echo) == 0);
+// 시간차로 거리계산
+static inline long diff_timespec_ns(const struct timespec* a, const struct timespec* b) { return (a->tv_sec - b->tv_sec) * 1000000000L + (a->tv_nsec - b->tv_nsec); }
 
-        struct timespec start, end;
-        clock_gettime(CLOCK_MONOTONIC, &start);  // 수신 시작 시간 기록
+// 스레드1: 초음파 거리 측정
+static void* th_measure(void* arg) {
+    (void)arg;
 
-        // ECHO 핀이 LOW 될 때까지 대기 (초음파 수신 끝)
-        while (gpiod_line_get_value(echo) == 1);
-        clock_gettime(CLOCK_MONOTONIC, &end);    // 수신 종료 시간 기록
-
-        // 시간 차이 계산 (마이크로초 단위)
-        double duration = (end.tv_sec - start.tv_sec) * 1e6 +
-                          (end.tv_nsec - start.tv_nsec) / 1000.0;
-
-        // 거리 계산: 음속을 이용하여 거리(cm)로 변환
-        distance = duration / 58.0;
-
-        usleep(100000);  // 100ms 간격으로 반복
+    // 트리거는 출력, 에코는 이벤트 입력
+    if (gpiod_line_request_output(line_trig, "ultraled_trig", 0) < 0) {
+        perror("gpiod_line_request_output(TRIG)");
+        g_stop = 1;
+        return NULL;
+    }
+    if (gpiod_line_request_both_edges_events(line_echo, "ultraled_echo") < 0) {
+        perror("gpiod_line_request_both_edges_events(ECHO)");
+        g_stop = 1;
+        return NULL;
     }
 
+    while (!g_stop) {
+        // 1) TRIG low로 안정화
+        gpiod_line_set_value(line_trig, 0);
+        nsleep(2000 * 1000L);  // 2ms
+
+        // 2) 10us HIGH 펄스
+        gpiod_line_set_value(line_trig, 1);
+        nsleep(10 * 1000L);  // 10us
+        gpiod_line_set_value(line_trig, 0);
+
+        // 3) Rising edge 대기
+        struct timespec timeout;
+        timeout.tv_sec = 0;
+        timeout.tv_nsec = 60 * 1000 * 1000L;  // 60ms
+        int ret = gpiod_line_event_wait(line_echo, &timeout);
+        if (ret <= 0) {
+            pthread_mutex_lock(&dist_mx);
+            distance = DIST_MAX + 1.0;
+            pthread_mutex_unlock(&dist_mx);
+            continue;
+        }
+
+        struct gpiod_line_event ev_rise;
+        if (gpiod_line_event_read(line_echo, &ev_rise) < 0 || ev_rise.event_type != GPIOD_LINE_EVENT_RISING_EDGE) continue;
+
+        // 4) Falling edge 대기
+        ret = gpiod_line_event_wait(line_echo, &timeout);
+        if (ret <= 0) {
+            pthread_mutex_lock(&dist_mx);
+            distance = DIST_MAX + 1.0;
+            pthread_mutex_unlock(&dist_mx);
+            continue;
+        }
+
+        struct gpiod_line_event ev_fall;
+        if (gpiod_line_event_read(line_echo, &ev_fall) < 0 || ev_fall.event_type != GPIOD_LINE_EVENT_FALLING_EDGE) continue;
+
+        // 5) 펄스폭(ns) → 거리(cm)
+        long dt_ns = diff_timespec_ns(&ev_fall.ts, &ev_rise.ts);
+        double pulse_us = (double)dt_ns / 1000.0;
+        double dist = (pulse_us * 0.0343) / 2.0;  // cm
+
+        if (dist < 0.0) dist = DIST_MAX + 1.0;
+
+        pthread_mutex_lock(&dist_mx);
+        distance = dist;
+        pthread_mutex_unlock(&dist_mx);
+
+        nsleep(50 * 1000 * 1000L);  // 50ms
+    }
+
+    gpiod_line_release(line_trig);
+    gpiod_line_release(line_echo);
     return NULL;
 }
 
-// LED 밝기 조절 스레드 함수 -PWM
-void* led_pwm_control(void* arg) {
-    while (1) {
-        double dist = distance;  // 공유 변수 읽기
+// 거리 → 듀티(0.0~1.0) 매핑
+static double distance_to_duty(double d) {
+    if (d <= DIST_MIN) return 1.0;
+    if (d >= DIST_MAX) return 0.0;
+    double t = (d - DIST_MIN) / (DIST_MAX - DIST_MIN);
+    return 1.0 - t;
+}
 
-        // 거리(0~50cm)에 따라 듀티비 조절 (가까울수록 밝게)
-        int duty = 0;
-        if (dist < 2.0)
-            duty = 100;         // 아주 가까우면 100% 밝기
-        else if (dist > 50.0)
-            duty = 0;           // 멀면 꺼짐
-        else
-            duty = (int)(100.0 - (dist / 50.0) * 100.0);  // 선형 보간
+// 스레드2: LED 소프트 PWM (libgpiod 기반)
+static void* th_pwm(void* arg) {
+    (void)arg;
 
-        int period_us = 10000;  // PWM 주기: 10ms (100Hz)
-        int on_time = (period_us * duty) / 100;     // LED ON 시간
-        int off_time = period_us - on_time;         // LED OFF 시간
-
-        gpiod_line_set_value(led, 1);   // ON
-        delay_us(on_time);
-        gpiod_line_set_value(led, 0);   // OFF
-        delay_us(off_time);
+    if (gpiod_line_request_output(line_led, "ultraled_led", 0) < 0) {
+        perror("gpiod_line_request_output(LED)");
+        g_stop = 1;
+        return NULL;
     }
 
+    const long period_ns = PWM_PERIOD_NS;
+    struct timespec wake;
+    clock_gettime(CLOCK_MONOTONIC, &wake);
+
+    while (!g_stop) {
+        double d;
+        pthread_mutex_lock(&dist_mx);
+        d = distance;
+        pthread_mutex_unlock(&dist_mx);
+
+        double duty = distance_to_duty(d);
+        if (duty < 0.0) duty = 0.0;
+        if (duty > 1.0) duty = 1.0;
+
+        long duty_ns = (long)(period_ns * duty);
+        if (duty_ns >= period_ns) duty_ns = period_ns - 1;
+        long off_ns = period_ns - duty_ns;
+
+        // HIGH 구간
+        if (duty_ns > 0) {
+            gpiod_line_set_value(line_led, 1);
+            wake.tv_nsec += duty_ns;
+            while (wake.tv_nsec >= 1000000000L) {
+                wake.tv_nsec -= 1000000000L;
+                wake.tv_sec++;
+            }
+            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wake, NULL);
+        } else {
+            gpiod_line_set_value(line_led, 0);
+        }
+
+        // LOW 구간
+        if (off_ns > 0) {
+            gpiod_line_set_value(line_led, 0);
+            wake.tv_nsec += off_ns;
+            while (wake.tv_nsec >= 1000000000L) {
+                wake.tv_nsec -= 1000000000L;
+                wake.tv_sec++;
+            }
+            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wake, NULL);
+        }
+    }
+
+    gpiod_line_release(line_led);
     return NULL;
 }
 
-int main() {
-    // GPIO 칩 열기
-    chip = gpiod_chip_open_by_name(CHIP_NAME);
+int main(int argc, char** argv) {
+    const char* chip_name = (argc >= 2) ? argv[1] : "gpiochip0";
+
+    signal(SIGINT, on_sigint);
+    signal(SIGTERM, on_sigint);
+
+    chip = gpiod_chip_open_by_name(chip_name);
     if (!chip) {
         perror("gpiod_chip_open_by_name");
-        exit(EXIT_FAILURE);
+        fprintf(stderr, "힌트: sudo gpiodetect 로 사용 가능한 gpiochip 확인 후 인자로 전달하세요.\n");
+        return 1;
     }
 
-    // 핀별 GPIO 라인 요청
-    trig = gpiod_chip_get_line(chip, TRIG_PIN);
-    echo = gpiod_chip_get_line(chip, ECHO_PIN);
-    led  = gpiod_chip_get_line(chip, LED_PIN);
-
-    // 핀 할당 실패 시 종료
-    if (!trig || !echo || !led) {
-        fprintf(stderr, "GPIO line request error\n");
-        exit(EXIT_FAILURE);
+    line_trig = gpiod_chip_get_line(chip, PIN_TRIG);
+    line_echo = gpiod_chip_get_line(chip, PIN_ECHO);
+    line_led = gpiod_chip_get_line(chip, PIN_LED);
+    if (!line_trig || !line_echo || !line_led) {
+        fprintf(stderr, "GPIO 라인 획득 실패(PIN_TRIG=%d, PIN_ECHO=%d, PIN_LED=%d)\n", PIN_TRIG, PIN_ECHO, PIN_LED);
+        gpiod_chip_close(chip);
+        return 1;
     }
 
-    // 핀 방향 설정
-    gpiod_line_request_output(trig, CONSUMER, 0);  // 출력: TRIG
-    gpiod_line_request_input(echo, CONSUMER);      // 입력: ECHO
-    gpiod_line_request_output(led, CONSUMER, 0);   // 출력: LED
+    pthread_t th1, th2;
+    if (pthread_create(&th1, NULL, th_measure, NULL) != 0) {
+        perror("pthread_create(th_measure)");
+        gpiod_chip_close(chip);
+        return 1;
+    }
+    if (pthread_create(&th2, NULL, th_pwm, NULL) != 0) {
+        perror("pthread_create(th_pwm)");
+        g_stop = 1;
+        pthread_join(th1, NULL);
+        gpiod_chip_close(chip);
+        return 1;
+    }
 
-    // 거리 측정 스레드 및 LED 제어 스레드 생성
-    pthread_t t1, t2;
-    pthread_create(&t1, NULL, measure_distance, NULL);
-    pthread_create(&t2, NULL, led_pwm_control, NULL);
+    pthread_join(th1, NULL);
+    pthread_join(th2, NULL);
 
-    // 메인 스레드는 두 스레드가 종료될 때까지 대기
-    pthread_join(t1, NULL);
-    pthread_join(t2, NULL);
-
-    // 종료 시 리소스 해제
-    gpiod_line_release(trig);
-    gpiod_line_release(echo);
-    gpiod_line_release(led);
-    gpiod_chip_close(chip);
-
+    if (chip) gpiod_chip_close(chip);
     return 0;
 }
